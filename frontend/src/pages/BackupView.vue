@@ -402,6 +402,7 @@ function adviceRowKey(row: AdviceRow): string {
           {{ counts.cracks ?? 0 }} / {{ counts.surveys ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="整治建议">{{ counts.advices ?? 0 }}</el-descriptions-item>
+        <el-descriptions-item label="区间调整单">{{ counts.adjustments ?? 0 }}</el-descriptions-item>
       </el-descriptions>
 
       <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px">

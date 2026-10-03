@@ -10,12 +10,13 @@ import type { Ring } from '@/types/ring'
 import type { Crack } from '@/types/crack'
 import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
+import type { AdjustmentOrder } from '@/types/adjustment'
 
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbtunnelcrack'
 
 /** 当前数据结构版本号：调整表结构必须递增并补 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键名 */
 export const LS_KEYS = {
@@ -34,7 +35,7 @@ export const DEFAULT_UI_PREFS: UiPrefs = {
   trendOnlyWarning: false
 }
 
-/** 整库备份文件结构 */
+/** 整库备份文件结构（adjustments 为 v3 新增，旧备份缺失时按空处理） */
 export interface BackupPayload {
   app: 'gbtunnelcrack'
   dbVersion: number
@@ -44,6 +45,7 @@ export interface BackupPayload {
   cracks: Crack[]
   surveys: Survey[]
   advices: Advice[]
+  adjustments?: AdjustmentOrder[]
 }
 
 /** 带行修订号的持久化实体，便于逐行迁移 */
@@ -59,6 +61,7 @@ export type RingRow = Ring & Revisioned
 export type CrackRow = Crack & Revisioned
 export type SurveyRow = Survey & Revisioned
 export type AdviceRow = Advice & Revisioned
+export type AdjustmentRow = AdjustmentOrder & Revisioned
 
 class TunnelCrackDatabase extends Dexie {
   sections!: Table<SectionRow, string>
@@ -66,6 +69,7 @@ class TunnelCrackDatabase extends Dexie {
   cracks!: Table<CrackRow, string>
   surveys!: Table<SurveyRow, string>
   advices!: Table<AdviceRow, string>
+  adjustments!: Table<AdjustmentRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -126,6 +130,16 @@ class TunnelCrackDatabase extends Dexie {
             }
           })
       })
+
+    // v3：新增区间调整单表（合并/拆分重划区间，调整单持久化、断点续跑、快照回滚）
+    this.version(DB_VERSION).stores({
+      sections: 'id, line, structureType, startMileage, updatedAt',
+      rings: 'id, sectionId, ringNo, mileage, segmentType, updatedAt',
+      cracks: 'id, ringId, sectionId, code, position, direction, state, updatedAt',
+      surveys: 'id, crackId, seq, date, surveyor, updatedAt',
+      advices: 'id, crackId, level, measure, state, updatedAt',
+      adjustments: 'id, kind, status, createdAt, updatedAt, appliedAt'
+    })
   }
 }
 
@@ -281,24 +295,26 @@ async function deleteCracksOfRings(ringIds: string[]): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, adjustments] = await Promise.all([
     db.sections.count(),
     db.rings.count(),
     db.cracks.count(),
     db.surveys.count(),
-    db.advices.count()
+    db.advices.count(),
+    db.adjustments.count()
   ])
-  return { sections, rings, cracks, surveys, advices }
+  return { sections, rings, cracks, surveys, advices, adjustments }
 }
 
 /** 导出整库快照（剥离内部 revision 字段） */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, adjustments] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.adjustments.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -312,40 +328,55 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     rings: rings.map(strip),
     cracks: cracks.map(strip),
     surveys: surveys.map(strip),
-    advices: advices.map(strip)
+    advices: advices.map(strip),
+    adjustments: adjustments.map(strip)
   }
 }
 
-/** 用快照覆盖整库 */
+/** 用快照覆盖整库（兼容 v2 旧备份：缺失 adjustments 时按空表处理，不阻断导入） */
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.rings.bulkPut((payload.rings ?? []).map(rev))
-    await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
-    await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
-    await db.advices.bulkPut((payload.advices ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.adjustments],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.adjustments.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      await db.rings.bulkPut((payload.rings ?? []).map(rev))
+      await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
+      await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
+      await db.advices.bulkPut((payload.advices ?? []).map(rev))
+      // 调整单自身已有完整字段，仅补行修订号；旧备份不含该字段时跳过
+      if (Array.isArray(payload.adjustments)) {
+        await db.adjustments.bulkPut(payload.adjustments.map(rev))
+      }
+    }
+  )
 }
 
 /** 清空全部业务表 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.adjustments],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.adjustments.clear()
+      ])
+    }
+  )
 }
 
 /** 清空后重新播种（演示数据重置） */

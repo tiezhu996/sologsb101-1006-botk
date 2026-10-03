@@ -7,7 +7,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Files, Grid, Plus, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, Edit, Files, Grid, Plus, Sort, TrendCharts } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -233,6 +233,7 @@ const totalRings = computed(() => sectionStore.rings.length)
         </p>
       </div>
       <div class="page-head__actions">
+        <el-button :icon="Sort" @click="router.push('/adjustments')">重划区间</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreateSection">新建区间</el-button>
         <el-button :icon="Grid" :disabled="!sectionStore.currentSectionId" @click="openCreateRing">录入环片</el-button>
       </div>
