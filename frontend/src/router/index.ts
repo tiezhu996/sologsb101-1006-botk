@@ -25,6 +25,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '复测测次与变化量对比', icon: 'DataLine' }
   },
   {
+    path: '/realign',
+    name: 'realign-board',
+    component: () => import('@/pages/RealignBoard.vue'),
+    meta: { title: '区间重划与归属调整', icon: 'Switch' }
+  },
+  {
     path: '/trends',
     name: 'trend-board',
     component: () => import('@/pages/TrendBoard.vue'),

@@ -32,7 +32,7 @@ docker compose up -d --build      # 改代码后重新构建启动
 | 框架 | Vue 3.5 | `<script setup>` + Composition API |
 | 语言 | TypeScript 5.7 | `strict` 严格模式，构建前执行 `vue-tsc --noEmit` |
 | UI 组件 | Element Plus 2.9 | 表格、表单、弹窗、抽屉、标签、进度 |
-| 状态管理 | Pinia 2.3 | `sectionStore` / `crackStore` / `surveyStore` |
+| 状态管理 | Pinia 2.3 | `sectionStore` / `crackStore` / `surveyStore` / `realignStore` |
 | 路由 | Vue Router 4.5 | History 模式，nginx `try_files` 回退 |
 | 本地持久化 | Dexie 4（IndexedDB） | 版本号 + `upgrade` 迁移 + 幂等播种 |
 | 构建 | Vite 6 | 输出 `dist/`，按路由自动分包 |
@@ -53,14 +53,17 @@ sologsb101-1006/
     ├── package.json / tsconfig.json / vite.config.ts / index.html
     ├── public/favicon.svg
     └── src/
-        ├── types/              # section.ts ring.ts crack.ts survey.ts advice.ts
-        ├── stores/             # sectionStore.ts crackStore.ts surveyStore.ts
+        ├── types/              # section.ts ring.ts crack.ts survey.ts advice.ts realign.ts
+        ├── stores/             # sectionStore.ts crackStore.ts surveyStore.ts realignStore.ts
         ├── components/common/  # LevelTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useCrackTrend.ts useIdbTable.ts
-        ├── pages/              # SectionList.vue CrackEntry.vue SurveyCompare.vue TrendBoard.vue BackupView.vue
+        ├── pages/              # SectionList.vue CrackEntry.vue SurveyCompare.vue RealignBoard.vue TrendBoard.vue BackupView.vue
         ├── router/index.ts
-        ├── utils/              # rate.ts db.ts export.ts
+        ├── utils/              # rate.ts db.ts export.ts realign.ts realignApply.ts
         ├── styles/main.css
+        ├── App.vue
+        └── main.ts
+    └── scripts/realign.smoke.ts  # 重划引擎 fake-indexeddb 冒烟测试（npx tsx 运行）
         ├── App.vue
         └── main.ts
 ```
@@ -72,17 +75,34 @@ sologsb101-1006/
 | `/sections` | 区间与环片里程台账 | Section、Ring | 新建/编辑/删除区间与环片；按线路、结构型式筛选；里程区间二维筛选；展开环片查看裂缝 |
 | `/cracks` | 裂缝初测录入 | Crack、Ring | 新增/编辑/删除裂缝；勾选批量改状态；单条状态流转（观察→待整治→已整治）；导出 CSV |
 | `/surveys` | 复测测次与变化量对比 | Survey、Crack | 按测次追加读数（自动比对生成变化量）；SVG 折线对比历次宽度；编辑/删除测次 |
+| `/realign` | 区间重划与归属调整 | RealignOrder、Section、Ring、Crack、Survey | 复检后重划行政分段（合并/拆分）；预览跨界环片·裂缝·受影响测次；逐环确认去向统一提交；冲突整单不写入；失败断点续提 |
 | `/trends` | 发展速率分级与预警 | Crack、Survey、Advice | 按月均速率降序排行；仅看预警开关；一键生成整治建议草稿；抽屉查看测次序列 |
 | `/backup` | 整治建议与数据备份 | 全部模型 | 建议状态流转（待下发→已下发→已完成）；导出/导入全量 JSON；导出 CSV；清空/重置演示数据 |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbtunnelcrack`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`sections`、`rings`、`cracks`、`surveys`、`advices`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的 `stores()` 索引变更与 `upgrade()` 迁移逻辑（补齐行修订号 `revision`、用所属环片回填历史裂缝的 `sectionId` 冗余列、补齐缺失的变化量字段）
+- **对象表**：`sections`、`rings`、`cracks`、`surveys`、`advices`、`realignOrders`
+- **数据结构版本**：`DB_VERSION = 3`
+  - `version(1)` → `version(2)`：补行修订号 `revision`、用所属环片回填历史裂缝 `sectionId` 冗余列、补齐变化量字段
+  - `version(2)` → `version(3)`：新增 `realignOrders`（区间重划调整单）表，既有业务表结构不变
+- **区间重划（`/realign`，`types/realign.ts` + `utils/realign.ts` + `utils/realignApply.ts`）**
+  - 行政分段与实体身份分离：重划只改 `ring.sectionId / ringNo / mileage`，**环片 `ring.id` 永不变**；裂缝随环片走（只同步 `crack.sectionId` 冗余列，`ringId` 不动），复测只认 `crackId` 完全不改
+  - 先在界面预览**跨界环片、裂缝、受影响测次**，逐环人工确认去向后统一提交
+  - 硬性冲突整单不写入、现台账继续可用：同一里程落入两个区间、目标区间内环号碰撞、已有裂缝/数据迁移后找不到所属环片
+  - 提交展开为幂等执行单元并逐单元落 `completed` 断点；写入失败保留调整单与已确认去向，重试从上次停止处继续
+  - 旧备份（v2，无 `realignOrders`）仍可导入：各业务表行数据原样回填，即恢复**原归属**；调整单字段缺省按空数组处理
 - **首屏自动播种**：`initDatabase()` 中 `if (await db.sections.count() === 0) await seedDatabase()`，播种 2 个区间 → 5 个环片 → 6 条裂缝 → 14 个测次 → 4 条建议的互相引用演示数据；播种为幂等操作，重复调用不会重复插入
 - **localStorage 辅助键**：`gbtunnelcrack:db-version`（结构版本号）、`gbtunnelcrack:last-backup-at`（最近备份时间）、`gbtunnelcrack:ui-prefs`（上次选中区间、仅看预警开关）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷；清理浏览器数据即清空业务数据（可在 `/backup` 页重新播种）
+
+### 重划引擎冒烟测试
+
+```bash
+cd frontend
+npm install
+npx tsx scripts/realign.smoke.ts   # fake-indexeddb 下验证拆分/合并/三类冲突拒绝/断点续提，共 42 项断言
+```
 
 ## 六、本地开发
 

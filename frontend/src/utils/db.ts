@@ -10,12 +10,13 @@ import type { Ring } from '@/types/ring'
 import type { Crack } from '@/types/crack'
 import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
+import type { RealignOrder } from '@/types/realign'
 
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbtunnelcrack'
 
 /** 当前数据结构版本号：调整表结构必须递增并补 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键名 */
 export const LS_KEYS = {
@@ -44,6 +45,8 @@ export interface BackupPayload {
   cracks: Crack[]
   surveys: Survey[]
   advices: Advice[]
+  /** v3 起携带区间重划调整单；旧备份（无此字段）导入时按空数组处理 */
+  realignOrders?: RealignOrder[]
 }
 
 /** 带行修订号的持久化实体，便于逐行迁移 */
@@ -52,13 +55,14 @@ export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type SectionRow = Section & Revisioned
 export type RingRow = Ring & Revisioned
 export type CrackRow = Crack & Revisioned
 export type SurveyRow = Survey & Revisioned
 export type AdviceRow = Advice & Revisioned
+export type RealignOrderRow = RealignOrder & Revisioned
 
 class TunnelCrackDatabase extends Dexie {
   sections!: Table<SectionRow, string>
@@ -66,6 +70,8 @@ class TunnelCrackDatabase extends Dexie {
   cracks!: Table<CrackRow, string>
   surveys!: Table<SurveyRow, string>
   advices!: Table<AdviceRow, string>
+  /** 区间重划调整单（草稿/失败/已提交），按线路与状态索引 */
+  realignOrders!: Table<RealignOrderRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -99,7 +105,7 @@ class TunnelCrackDatabase extends Dexie {
         ]
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
-            row.revision = ROW_REVISION
+            row.revision = 2
           })
         }
 
@@ -126,6 +132,11 @@ class TunnelCrackDatabase extends Dexie {
             }
           })
       })
+
+    // v3：新增「区间重划调整单」表（realignOrders）。既有业务表结构不变，无需搬移数据。
+    this.version(DB_VERSION).stores({
+      realignOrders: 'id, line, status, updatedAt'
+    })
   }
 }
 
@@ -219,13 +230,17 @@ const SEED_ADVICES: AdviceRow[] = [
 
 /** 幂等播种：仅当主表为空时写入演示数据 */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await db.sections.bulkPut(SEED_SECTIONS)
-    await db.rings.bulkPut(SEED_RINGS)
-    await db.cracks.bulkPut(SEED_CRACKS)
-    await db.surveys.bulkPut(SEED_SURVEYS)
-    await db.advices.bulkPut(SEED_ADVICES)
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.realignOrders],
+    async () => {
+      await db.sections.bulkPut(SEED_SECTIONS)
+      await db.rings.bulkPut(SEED_RINGS)
+      await db.cracks.bulkPut(SEED_CRACKS)
+      await db.surveys.bulkPut(SEED_SURVEYS)
+      await db.advices.bulkPut(SEED_ADVICES)
+    }
+  )
 }
 
 /** 应用启动时调用：打开数据库并在首屏为空时播种 */
@@ -281,24 +296,26 @@ async function deleteCracksOfRings(ringIds: string[]): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, realignOrders] = await Promise.all([
     db.sections.count(),
     db.rings.count(),
     db.cracks.count(),
     db.surveys.count(),
-    db.advices.count()
+    db.advices.count(),
+    db.realignOrders.count()
   ])
-  return { sections, rings, cracks, surveys, advices }
+  return { sections, rings, cracks, surveys, advices, realignOrders }
 }
 
 /** 导出整库快照（剥离内部 revision 字段） */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, realignOrders] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.realignOrders.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -312,38 +329,46 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     rings: rings.map(strip),
     cracks: cracks.map(strip),
     surveys: surveys.map(strip),
-    advices: advices.map(strip)
+    advices: advices.map(strip),
+    realignOrders: realignOrders.map(strip)
   }
 }
 
-/** 用快照覆盖整库 */
+/** 用快照覆盖整库（旧备份无 realignOrders 字段时按空数组处理，原归属仍由各表行数据回填） */
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await Promise.all([
-      db.sections.clear(),
-      db.rings.clear(),
-      db.cracks.clear(),
-      db.surveys.clear(),
-      db.advices.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.rings.bulkPut((payload.rings ?? []).map(rev))
-    await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
-    await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
-    await db.advices.bulkPut((payload.advices ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.realignOrders],
+    async () => {
+      await Promise.all([
+        db.sections.clear(),
+        db.rings.clear(),
+        db.cracks.clear(),
+        db.surveys.clear(),
+        db.advices.clear(),
+        db.realignOrders.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      await db.rings.bulkPut((payload.rings ?? []).map(rev))
+      await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
+      await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
+      await db.advices.bulkPut((payload.advices ?? []).map(rev))
+      await db.realignOrders.bulkPut((payload.realignOrders ?? []).map(rev))
+    }
+  )
 }
 
-/** 清空全部业务表 */
+/** 清空全部业务表（调整单一并清空） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
+  await db.transaction('rw', [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.realignOrders], async () => {
     await Promise.all([
       db.sections.clear(),
       db.rings.clear(),
       db.cracks.clear(),
       db.surveys.clear(),
-      db.advices.clear()
+      db.advices.clear(),
+      db.realignOrders.clear()
     ])
   })
 }
